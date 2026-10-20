@@ -16,6 +16,7 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Completion\CompletionInput;
 use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Exception\InvalidArgumentException;
+use Symfony\Component\Console\Exception\InvalidOptionException;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -36,6 +37,8 @@ use Symfony\Contracts\Translation\TranslatorInterface;
  * and comparing them with the fallback ones.
  *
  * @author Florian Voutzinos <florian@voutzinos.com>
+ *
+ * @phpstan-type Row array{domain: string, id: string, states: list<int>, translation: ?string, fallbacks: list<?string>}
  */
 #[AsCommand(name: 'debug:translation', description: 'Display translation messages information')]
 class TranslationDebugCommand extends Command
@@ -76,6 +79,7 @@ class TranslationDebugCommand extends Command
                 new InputOption('only-missing', null, InputOption::VALUE_NONE, 'Display only missing messages'),
                 new InputOption('only-unused', null, InputOption::VALUE_NONE, 'Display only unused messages'),
                 new InputOption('all', null, InputOption::VALUE_NONE, 'Load messages from all registered bundles'),
+                new InputOption('format', null, InputOption::VALUE_REQUIRED, \sprintf('The output format ("%s")', implode('", "', $this->getAvailableFormatOptions())), 'txt'),
             ])
             ->setHelp(<<<'EOF'
                 The <info>%command.name%</info> command helps finding unused or missing translation
@@ -106,9 +110,22 @@ class TranslationDebugCommand extends Command
 
                   <info>php %command.full_name% --all en</info>
 
+                The <info>--format</info> option specifies the format of the command output.
+                The <info>json</info> and <info>csv</info> formats contain the full messages and are meant to be parsed by other tools:
+
+                  <info>php %command.full_name% --format=json en</info>
+                  <info>php %command.full_name% --format=csv en > translations.csv</info>
+
                 EOF
             )
         ;
+    }
+
+    protected function initialize(InputInterface $input, OutputInterface $output): void
+    {
+        if (!\in_array($input->getOption('format'), $this->getAvailableFormatOptions(), true)) {
+            throw new InvalidOptionException(\sprintf('Supported formats are "%s".', implode('", "', $this->getAvailableFormatOptions())));
+        }
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -188,15 +205,12 @@ class TranslationDebugCommand extends Command
         // Load the fallback catalogues
         $fallbackCatalogues = $this->loadFallbackCatalogues($locale, $transPaths);
 
-        // Display header line
-        $headers = ['State', 'Domain', 'Id', \sprintf('Message Preview (%s)', $locale)];
-        foreach ($fallbackCatalogues as $fallbackCatalogue) {
-            $headers[] = \sprintf('Fallback Message Preview (%s)', $fallbackCatalogue->getLocale());
-        }
         $rows = [];
         // Iterate all message ids and determine their state
         foreach ($allMessages as $domain => $messages) {
             foreach (array_keys($messages) as $messageId) {
+                // numeric ids are turned into integers when used as array keys
+                $messageId = (string) $messageId;
                 $value = $currentCatalogue->get($messageId, $domain);
                 $states = [];
 
@@ -232,16 +246,29 @@ class TranslationDebugCommand extends Command
                     }
                 }
 
-                $row = [$this->formatStates($states), $domain, $this->formatId($messageId), $this->sanitizeString($value)];
+                $fallbacks = [];
                 foreach ($fallbackCatalogues as $fallbackCatalogue) {
-                    $row[] = $this->sanitizeString($fallbackCatalogue->get($messageId, $domain));
+                    $fallbacks[] = $fallbackCatalogue->defines($messageId, $domain) ? $fallbackCatalogue->get($messageId, $domain) : null;
                 }
 
-                $rows[] = $row;
+                $rows[] = [
+                    'domain' => (string) $domain,
+                    'id' => $messageId,
+                    'states' => $states,
+                    'translation' => $currentCatalogue->defines($messageId, $domain) ? $value : null,
+                    'fallbacks' => $fallbacks,
+                ];
             }
         }
 
-        $io->table($headers, $rows);
+        $fallbackLocales = array_map(static fn (MessageCatalogue $catalogue) => $catalogue->getLocale(), $fallbackCatalogues);
+
+        match ($input->getOption('format')) {
+            'txt' => $this->renderTxt($io, $locale, $fallbackLocales, $rows),
+            'json' => $this->renderJson($output, $fallbackLocales, $rows),
+            'csv' => $this->renderCsv($output, $locale, $fallbackLocales, $rows),
+            default => throw new InvalidOptionException(\sprintf('Supported formats are "%s".', implode('", "', $this->getAvailableFormatOptions()))),
+        };
 
         return $exitCode;
     }
@@ -250,6 +277,12 @@ class TranslationDebugCommand extends Command
     {
         if ($input->mustSuggestArgumentValuesFor('locale')) {
             $suggestions->suggestValues($this->enabledLocales);
+
+            return;
+        }
+
+        if ($input->mustSuggestOptionValuesFor('format')) {
+            $suggestions->suggestValues($this->getAvailableFormatOptions());
 
             return;
         }
@@ -282,6 +315,111 @@ class TranslationDebugCommand extends Command
 
             $suggestions->suggestValues($mergeOperation->getDomains());
         }
+    }
+
+    /**
+     * @param string[]  $fallbackLocales
+     * @param list<Row> $rows
+     */
+    private function renderTxt(SymfonyStyle $io, string $locale, array $fallbackLocales, array $rows): void
+    {
+        $headers = ['State', 'Domain', 'Id', \sprintf('Message Preview (%s)', $locale)];
+        foreach ($fallbackLocales as $fallbackLocale) {
+            $headers[] = \sprintf('Fallback Message Preview (%s)', $fallbackLocale);
+        }
+
+        $tableRows = [];
+        foreach ($rows as $row) {
+            $tableRow = [$this->formatStates($row['states']), $row['domain'], $this->formatId($row['id']), $this->sanitizeString($row['translation'] ?? $row['id'])];
+            foreach ($row['fallbacks'] as $fallback) {
+                $tableRow[] = $this->sanitizeString($fallback ?? $row['id']);
+            }
+
+            $tableRows[] = $tableRow;
+        }
+
+        $io->table($headers, $tableRows);
+    }
+
+    /**
+     * @param string[]  $fallbackLocales
+     * @param list<Row> $rows
+     */
+    private function renderJson(OutputInterface $output, array $fallbackLocales, array $rows): void
+    {
+        $getStateName = $this->getStateName(...);
+
+        $data = [];
+        foreach ($rows as $row) {
+            $data[] = [
+                'domain' => $row['domain'],
+                'id' => $row['id'],
+                'states' => array_map($getStateName, $row['states']),
+                'translation' => $row['translation'],
+                // an empty map must be encoded as {} and not as []
+                'fallbacks' => (object) array_combine($fallbackLocales, $row['fallbacks']),
+            ];
+        }
+
+        // the raw output prevents the formatter from altering messages containing tags
+        $output->writeln(json_encode($data, \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE | \JSON_THROW_ON_ERROR), OutputInterface::OUTPUT_RAW);
+    }
+
+    /**
+     * @param string[]  $fallbackLocales
+     * @param list<Row> $rows
+     */
+    private function renderCsv(OutputInterface $output, string $locale, array $fallbackLocales, array $rows): void
+    {
+        $getStateName = $this->getStateName(...);
+
+        $headers = ['states', 'domain', 'id', 'translation_'.$locale];
+        foreach ($fallbackLocales as $fallbackLocale) {
+            $headers[] = 'fallback_'.$fallbackLocale;
+        }
+        $this->writeCsvLine($output, $headers);
+
+        foreach ($rows as $row) {
+            $this->writeCsvLine($output, [
+                implode(' ', array_map($getStateName, $row['states'])),
+                $row['domain'],
+                $row['id'],
+                $row['translation'] ?? '',
+                ...array_map(static fn (?string $fallback) => $fallback ?? '', $row['fallbacks']),
+            ]);
+        }
+    }
+
+    /**
+     * @param list<string> $fields
+     */
+    private function writeCsvLine(OutputInterface $output, array $fields): void
+    {
+        $handle = fopen('php://memory', 'r+');
+        fputcsv($handle, $fields, ';', '"', '');
+        rewind($handle);
+
+        // the raw output prevents the formatter from altering messages containing tags
+        $output->write(stream_get_contents($handle), false, OutputInterface::OUTPUT_RAW);
+        fclose($handle);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getAvailableFormatOptions(): array
+    {
+        return ['txt', 'json', 'csv'];
+    }
+
+    private function getStateName(int $state): string
+    {
+        return match ($state) {
+            self::MESSAGE_MISSING => 'missing',
+            self::MESSAGE_UNUSED => 'unused',
+            self::MESSAGE_EQUALS_FALLBACK => 'fallback',
+            default => (string) $state,
+        };
     }
 
     private function formatState(int $state): string
